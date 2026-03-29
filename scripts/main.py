@@ -248,16 +248,19 @@ def download_and_process(cfg, invoice_emails):
             # 合并：多张发票对应多张行程单
             if inv_infos:
                 for inv in inv_infos:
+                    # 通行费已有 pdf_paths，其他类型只有一张发票
+                    inv_pdf_paths = inv.get('pdf_paths', [inv['pdf_path']])
+                    
                     # 火车票/飞机票已从发票提取 from/to，优先使用
                     if inv.get('type') in ('火车票', '飞机票') and inv.get('from') and inv.get('to'):
-                        all_records.append({**inv, 'trip_count': 0, 'pdf_paths': [inv['pdf_path']]})
+                        all_records.append({**inv, 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
                     elif trips:
                         if len(trips) == 1:
-                            all_records.append({**inv, 'from': trips[0]['from'], 'to': trips[0]['to'], 'trip_count': 1, 'pdf_paths': [inv['pdf_path']]})
+                            all_records.append({**inv, 'from': trips[0]['from'], 'to': trips[0]['to'], 'trip_count': 1, 'pdf_paths': inv_pdf_paths})
                         else:
-                            all_records.append({**inv, 'from': f"对应{len(trips)}个行程", 'to': '', 'trip_count': len(trips), 'pdf_paths': [inv['pdf_path']]})
+                            all_records.append({**inv, 'from': f"对应{len(trips)}个行程", 'to': '', 'trip_count': len(trips), 'pdf_paths': inv_pdf_paths})
                     else:
-                        all_records.append({**inv, 'from': inv.get('from', '详见发票'), 'to': inv.get('to', '详见发票'), 'trip_count': 0, 'pdf_paths': [inv['pdf_path']]})
+                        all_records.append({**inv, 'from': inv.get('from', '详见发票'), 'to': inv.get('to', '详见发票'), 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
             else:
                 # 只有行程单没有发票
                 for t in trips:
@@ -272,18 +275,28 @@ def build_word(all_records):
     
     # 预计算所有 PDF 页面
     all_pages = []
-    for rec in all_records:
+    for rec_idx, rec in enumerate(all_records):
+        # 获取所有 PDF 路径（通行费有多张，其他只有一张）
         pdf_paths = rec.get('pdf_paths', [])
         if not pdf_paths and rec.get('pdf_path'):
             pdf_paths = [rec['pdf_path']]
+        
+        # 防错检查：如果没有 PDF 路径，记录警告
+        if not pdf_paths:
+            print(f"  ⚠️  记录{rec_idx+1} ({rec.get('type', '')} {rec.get('inv_no', '')[:20]}) 没有 PDF 路径")
+            continue
+        
         for pdf_idx, pdf_path in enumerate(pdf_paths):
-            if os.path.exists(pdf_path):
-                inv_no = rec.get('inv_no', '').split('\n')[0] if rec.get('inv_no') else ''
-                suffix = f" ({pdf_idx+1}/{len(pdf_paths)})" if len(pdf_paths) > 1 else ''
-                all_pages.append({
-                    'pdf_path': pdf_path,
-                    'page_text': f"{inv_no[:20]}{suffix}"
-                })
+            if not os.path.exists(pdf_path):
+                print(f"  ⚠️  PDF 不存在：{pdf_path}")
+                continue
+            
+            inv_no = rec.get('inv_no', '').split('\n')[0] if rec.get('inv_no') else ''
+            suffix = f" ({pdf_idx+1}/{len(pdf_paths)})" if len(pdf_paths) > 1 else ''
+            all_pages.append({
+                'pdf_path': pdf_path,
+                'page_text': f"{inv_no[:20]}{suffix}"
+            })
     
     print(f"  共{len(all_pages)}张发票需要渲染")
     
