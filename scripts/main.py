@@ -303,15 +303,6 @@ def build_word(all_records):
             sec.left_margin = Mm(8); sec.right_margin = Mm(8)
             sec.top_margin = Mm(8); sec.bottom_margin = Mm(8)
         
-        # 行程信息标注行
-        p1 = doc.add_paragraph()
-        p1.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        info = f"【第{idx}页】{rec['type']} | 发票号: {rec['inv_no']} | 日期: {rec['trip_date']} | ¥{rec['amount']:.2f} | {rec['from']} → {rec['to']}"
-        run = p1.add_run(info)
-        run.font.size = Pt(8)
-        run.font.name = "微软雅黑"
-        p1.paragraph_format.space_after = Pt(2)
-        
         # PDF图片
         if os.path.exists(rec['pdf_path']):
             try:
@@ -329,6 +320,14 @@ def build_word(all_records):
                 run2.add_picture(img_path, width=Mm(194))
             except Exception as e:
                 print(f"    PDF渲染失败 {rec['inv_no']}: {e}")
+        
+        # 右下角页码
+        p3 = doc.add_paragraph()
+        p3.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        run3 = p3.add_run()
+        run3.text = f"Page {idx}"
+        run3.font.size = Pt(7)
+        run3.font.name = "Arial"
         
         rec['word_page'] = idx
     
