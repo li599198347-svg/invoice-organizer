@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 敏感信息 - 不要上传凭证
+config.env
+.env
+*.env
+MEMORY.md
+memory/
+*.log
+
+# 输出文件
+发票 PDF/
+行程单 PDF/
+差旅发票汇总.xlsx
+差旅发票汇总打印.docx
+_tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
