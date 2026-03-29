@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """差旅发票整理 - 按邮件分组处理发票和行程单"""
-import os, sys, re, zipfile, shutil, imaplib, email, fitz
+import os, sys, re, zipfile, shutil, imaplib, email, fitz, quopri
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from docx import Document
@@ -64,13 +64,15 @@ def scan_invoices(cfg, start_date, end_date):
             inv_type = '阳光出行' if '第三方' in subject else '滴滴'
         elif 'txffp.com' in sender or '通行费' in subject:
             inv_type = '通行费'
+        elif '携程' in subject or 'ctrip' in sender.lower() or 'trip.com' in sender.lower():
+            inv_type = '携程机票'  # ⚠️ 未经测试
         elif '火车票' in subject or '高铁' in subject or '铁路' in subject or '12306' in sender.lower():
-            inv_type = '火车票'  # ⚠️ 未经测试
+            inv_type = '12306 火车票'
         elif '机票' in subject or '航空' in subject or '行程单' in subject or '客票' in subject:
             inv_type = '飞机票'  # ⚠️ 未经测试
         if inv_type:
             invoice_emails.setdefault(inv_type, []).append({'seq': seq, 'subject': subject, 'date': email_date})
-            marker = '⚠️' if inv_type in ('火车票', '飞机票') else ''
+            marker = '⚠️' if inv_type in ('火车票', '飞机票', '携程机票') else ''
             print(f"  [{seq}] {inv_type}: {subject[:50]} {marker}")
     mail.logout()
     return invoice_emails
@@ -84,17 +86,50 @@ def extract_trips_from_pdf(trip_path):
         trips = []
         # 从行程单提取实际行程日期
         trip_date = ''
+        # 滴滴/阳光出行格式：行程起止日期：2026-03-15 至 2026-03-15
         date_m = re.search(r'行程起止日期.*?(\d{4}-\d{2}-\d{2})', raw_text)
         if date_m: trip_date = date_m.group(1)
+        # 通行费格式：通行日期 起止 \n 1 \n 20260310 \n 20260310（用 DOTALL 匹配换行）
+        if not trip_date:
+            date_m = re.search(r'通行日期.*?(\d{8})', raw_text, re.DOTALL)
+            if date_m:
+                d = date_m.group(1)
+                trip_date = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
         
-        # 找到所有数字里程行
+        # 找到所有数字里程行（第一个是里程，跳过金额）
+        mileage_found = False
         for i, text in enumerate(non_empty):
             if re.match(r'^\d+\.\d+$', text):
+                if mileage_found: continue  # 跳过金额行
+                mileage_found = True
+                
                 seq_idx = next((k for k in range(i - 1, max(0, i - 20), -1) if non_empty[k].isdigit()), -1)
                 if seq_idx < 0: continue
                 between = non_empty[seq_idx + 1:i]
+                
+                # 特殊处理：如果序号后第一行包含多个字段（空格分隔的单行格式）
+                if between and ' ' in between[0]:
+                    # 单行格式："滴滴特快 03-13 16:22 周五 深圳市"
+                    parts = between[0].split()
+                    # 查找城市
+                    cities = ['北京', '上海', '广州', '深圳', '成都', '重庆', '杭州', '西安', '南京', '武汉', '苏州', '天津']
+                    city_idx = next((k for k, t in enumerate(parts) if t in cities or (len(t) <= 5 and '市' in t)), -1)
+                    # 起点终点可能在后续行
+                    from_to_parts = parts[city_idx + 1:] if city_idx >= 0 else []
+                    from_to_parts.extend(between[1:])  # 添加后续行
+                    if len(from_to_parts) >= 2:
+                        mid = len(from_to_parts) // 2
+                        from_loc = ''.join(from_to_parts[:mid]).strip()
+                        to_loc = ''.join(from_to_parts[mid:]).strip()
+                        if from_loc and to_loc and len(from_loc) > 2 and len(to_loc) > 2:
+                            trips.append({'from': from_loc, 'to': to_loc, 'date': trip_date})
+                    continue
+                
                 if len(between) < 4: continue
-                city_idx = next((k for k, t in enumerate(between) if len(t) <= 4 and '市' in t), -1)
+                
+                # 查找城市（常见城市名或含"市"的短词）
+                cities = ['北京', '上海', '广州', '深圳', '成都', '重庆', '杭州', '西安', '南京', '武汉', '苏州', '天津']
+                city_idx = next((k for k, t in enumerate(between) if t in cities or (len(t) <= 5 and '市' in t and len(t) >= 2)), -1)
                 from_to = between[city_idx + 1:] if city_idx >= 0 else between
                 if len(from_to) >= 2:
                     mid = len(from_to) // 2
@@ -127,6 +162,25 @@ def download_and_process(cfg, invoice_emails):
             raw = data[0][1]
             msg = email.message_from_bytes(raw)
             
+            # 携程机票：从邮件正文提取行程信息（默认当年，日期 + 行程放一起）
+            ctrip_route = ''
+            if inv_type == '携程机票':
+                body = ''
+                for part in msg.walk():
+                    ctype = part.get_content_type()
+                    if ctype == 'text/html':
+                        try:
+                            payload = part.get_payload()
+                            if payload:
+                                body += quopri.decodestring(payload).decode('utf-8', errors='replace')
+                        except: pass
+                
+                # 简化正则：匹配"年 X 月 X 日 城市 - 城市"
+                trip_m = re.search(r'年 (\d{1,2}) 月 (\d{1,2}) 日\s*([^\s<]+?)\s*[-–—]\s*([^\s<]+)', body)
+                if trip_m:
+                    # 日期 + 行程放一起
+                    ctrip_route = f"2026-{trip_m.group(1).zfill(2)}-{trip_m.group(2).zfill(2)} {trip_m.group(3).strip()}-{trip_m.group(4).strip()}"
+            
             counter, inv_infos, trips = {}, [], []
             for part in msg.walk():
                 filename = decode_str(part.get_filename(''))
@@ -155,22 +209,63 @@ def download_and_process(cfg, invoice_emails):
                     elif not is_toll_summary:
                         # 普通发票（跳过通行费汇总单）
                         try:
-                            text = " ".join(extract_text(tmp_path).split()).replace(" ", "")
+                            raw_text = extract_text(tmp_path)
+                            # 彻底去掉所有空白字符（包括特殊空白如\u00a0）
+                            text = raw_text.replace(' ', '').replace('\u00a0', '').replace('\t', '').replace('\n', '').replace('\r', '')
                         except: text = ''
                         inv_no = ''
                         from_loc, to_loc = '', ''
                         
+                        # 提取发票号和行程信息
+                        inv_no = ''
+                        from_loc, to_loc = '', ''
+                        trip_date = ''
+                        
                         if inv_type in ('滴滴', '阳光出行'):
-                            m = re.search(r'发票号码 [：:]+\s*([\d]+)', text)
+                            # 提取发票号
+                            m = re.search(r'发票号码.*?([\d]+)', text)
                             if m: inv_no = m.group(1)
-                        elif inv_type == '火车票':  # ⚠️ 未经测试
-                            m = re.search(r'发票号码 [：:]\s*([\d]+)', text)
-                            if m: inv_no = m.group(1)
-                            # 提取出发站/到达站
-                            from_m = re.search(r'出发站 [：:]\s*(.+?)$', text, re.M)
-                            to_m = re.search(r'到达站 [：:]\s*(.+?)$', text, re.M)
+                            # 提取行程日期
+                            date_m = re.search(r'出行日期 [：:]+\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})', text)
+                            if date_m: trip_date = date_m.group(1).replace('/', '-')
+                            # 提取起点终点
+                            from_m = re.search(r'出\s*发\s*地 [：:]*\s*([\u4e00-\u9fffA-Za-z0-9\(\)\|\-]{2,50}?)', text)
+                            to_m = re.search(r'到\s*达\s*地 [：:]*\s*([\u4e00-\u9fffA-Za-z0-9\(\)\|\-]{2,50}?)', text)
                             if from_m: from_loc = from_m.group(1).strip()
                             if to_m: to_loc = to_m.group(1).strip()
+                            
+                        elif inv_type == '12306 火车票':
+                            # 12306 格式特殊：文字连续无换行
+                            # 发票号：发票号码:26329166827000948449
+                            m = re.search(r'发票号码 [：:]?\s*(\d{20})', text)
+                            if m: inv_no = m.group(1)
+                            
+                            # 车次 + 日期：G83632026 年 02 月 23 日（车次和年份可能连在一起）
+                            # 车次号通常 1-4 位数字，年份 4 位数字
+                            # \s*允许数字和"年/月/日"之间有无空格
+                            train_m = re.search(r'([GDKZTC]\d{1,4})(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', text)
+                            if train_m:
+                                trip_date = f"{train_m.group(2)}-{train_m.group(3).zfill(2)}-{train_m.group(4).zfill(2)}"
+                            
+                            # 站点：徐州东站、上海虹桥站
+                            # 12306 PDF 中站点顺序：到达站在前，出发站在后（因为文字是从右到左读的）
+                            stations = []
+                            for m in re.finditer(r'([北京上海广州深圳徐州南京杭州武汉成都重庆西安苏州天津虹桥][^\s:：]*?站)', text):
+                                station = m.group(1)
+                                if '站' in station and '开票' not in station and '电子客票' not in station:
+                                    stations.append(station)
+                            # 反转顺序：第一个是出发站，第二个是到达站
+                            if len(stations) >= 2:
+                                from_loc = stations[-1].strip()  # 最后一个（徐州东站）
+                                to_loc = stations[-2].strip()   # 倒数第二个（上海虹桥站）
+                            elif len(stations) == 1:
+                                from_loc = stations[0].strip()
+                            
+                            # 票价：票价:￥306.00
+                            price_m = re.search(r'票价 [：:]?\s*[￥¥]?(\d+\.?\d*)', text)
+                            if price_m:
+                                amount = float(price_m.group(1))
+                            
                         elif inv_type == '飞机票':  # ⚠️ 未经测试
                             m = re.search(r'发票代码 [：:]\s*([\d]+)', text) or re.search(r'发票号码 [：:]\s*([\d]+)', text)
                             if m: inv_no = m.group(1)
@@ -179,21 +274,33 @@ def download_and_process(cfg, invoice_emails):
                             to_m = re.search(r'目的地 [：:]\s*(.+?)$', text, re.M) or re.search(r'到达站 [：:]\s*(.+?)$', text, re.M)
                             if from_m: from_loc = from_m.group(1).strip()
                             if to_m: to_loc = to_m.group(1).strip()
+                            
+                        elif inv_type == '携程机票':
+                            # 简化处理：只提取发票号和金额
+                            order_m = re.search(r'订单.*?(\d+)', os.path.basename(tmp_path))
+                            if order_m: inv_no = f"携程{order_m.group(1)}"
+                            # 携程不提取行程，显示"详见发票"
+                            from_loc = '详见发票'
+                            to_loc = ''
                         
+                        # 如果没提取到发票号，用文件名
                         if not inv_no:
                             parts = os.path.basename(tmp_path).replace('.pdf','').split('_')
                             inv_no = parts[-1] if len(parts) > 2 else os.path.basename(tmp_path).replace('.pdf','')
                         
+                        # PDF 以发票号命名
                         final_path = f"{pdf_dir}/{inv_no}.pdf"
                         if not os.path.exists(final_path): shutil.copy(tmp_path, final_path)
+                        
+                        # 提取金额
                         amounts = re.findall(r'(\d+\.\d+)', text)
                         amount = float(amounts[-1]) if amounts else 0
                         
                         inv_infos.append({
                             'inv_no': inv_no, 'amount': amount, 'pdf_path': final_path,
-                            'type': inv_type, 'from': from_loc, 'to': to_loc
+                            'type': inv_type, 'from': from_loc, 'to': to_loc, 'trip_date': trip_date
                         })
-                        marker = '⚠️' if inv_type in ('火车票', '飞机票') else ''
+                        marker = '⚠️' if inv_type in ('火车票', '飞机票', '携程机票') else ''
                         print(f"    [发票] {inv_no} ¥{amount} {from_loc or ''}→{to_loc or ''} {marker}".strip())
                 
                 elif filename.endswith('.zip') and '通行费' in filename:
@@ -247,24 +354,63 @@ def download_and_process(cfg, invoice_emails):
             
             # 合并：多张发票对应多张行程单
             if inv_infos:
-                for inv in inv_infos:
-                    # 通行费已有 pdf_paths，其他类型只有一张发票
-                    inv_pdf_paths = inv.get('pdf_paths', [inv['pdf_path']])
-                    
-                    # 火车票/飞机票已从发票提取 from/to，优先使用
-                    if inv.get('type') in ('火车票', '飞机票') and inv.get('from') and inv.get('to'):
-                        all_records.append({**inv, 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
-                    elif trips:
-                        if len(trips) == 1:
-                            all_records.append({**inv, 'from': trips[0]['from'], 'to': trips[0]['to'], 'trip_count': 1, 'pdf_paths': inv_pdf_paths})
+                # 滴滴/阳光出行：按顺序匹配行程单（一张发票对应一张行程单）
+                if inv_type in ('滴滴', '阳光出行') and trips:
+                    for i, inv in enumerate(inv_infos):
+                        inv_pdf_paths = inv.get('pdf_paths', [inv['pdf_path']])
+                        # 如果发票没有行程信息，从行程单中获取
+                        if (not inv.get('from') or not inv.get('to')) and i < len(trips):
+                            trip = trips[i]
+                            trip_date = inv.get('trip_date') or trip.get('date', '')
+                            all_records.append({
+                                **inv, 'from': trip['from'], 'to': trip['to'],
+                                'trip_date': trip_date, 'trip_count': 0, 'pdf_paths': inv_pdf_paths
+                            })
                         else:
-                            all_records.append({**inv, 'from': f"对应{len(trips)}个行程", 'to': '', 'trip_count': len(trips), 'pdf_paths': inv_pdf_paths})
-                    else:
-                        all_records.append({**inv, 'from': inv.get('from', '详见发票'), 'to': inv.get('to', '详见发票'), 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
+                            all_records.append({**inv, 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
+                # 通行费：从行程单获取入口站/出口站和日期
+                elif inv_type == '通行费' and trips:
+                    trip = trips[0]
+                    trip_date = trip.get('date', '')
+                    print(f"    通行费 trips[0].date={trip_date}, from={trip.get('from')}, to={trip.get('to')}")
+                    for inv in inv_infos:
+                        inv_pdf_paths = inv.get('pdf_paths', [inv['pdf_path']])
+                        all_records.append({
+                            **inv, 'from': trip['from'], 'to': trip['to'],
+                            'trip_date': trip_date, 'trip_count': 0, 'pdf_paths': inv_pdf_paths
+                        })
+                # 通行费无行程单
+                elif inv_type == '通行费':
+                    for inv in inv_infos:
+                        inv_pdf_paths = inv.get('pdf_paths', [inv['pdf_path']])
+                        all_records.append({**inv, 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
+                # 携程简化处理
+                elif inv_type == '携程机票':
+                    for inv in inv_infos:
+                        inv_pdf_paths = inv.get('pdf_paths', [inv['pdf_path']])
+                        all_records.append({**inv, 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
+                # 12306 火车票保留提取的行程信息
+                elif inv_type == '12306 火车票':
+                    for inv in inv_infos:
+                        inv_pdf_paths = inv.get('pdf_paths', [inv['pdf_path']])
+                        all_records.append({**inv, 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
+                # 其他情况
+                else:
+                    for inv in inv_infos:
+                        inv_pdf_paths = inv.get('pdf_paths', [inv['pdf_path']])
+                        if trips:
+                            if len(trips) == 1:
+                                trip_date = inv.get('trip_date') or trips[0].get('date', '')
+                                all_records.append({**inv, 'from': trips[0]['from'], 'to': trips[0]['to'], 'trip_date': trip_date, 'trip_count': 1, 'pdf_paths': inv_pdf_paths})
+                            else:
+                                trip_date = inv.get('trip_date') or trips[0].get('date', '')
+                                all_records.append({**inv, 'from': f"对应{len(trips)}个行程", 'to': '', 'trip_date': trip_date, 'trip_count': len(trips), 'pdf_paths': inv_pdf_paths})
+                        else:
+                            all_records.append({**inv, 'from': inv.get('from', '详见发票'), 'to': inv.get('to', '详见发票'), 'trip_date': inv.get('trip_date', ''), 'trip_count': 0, 'pdf_paths': inv_pdf_paths})
             else:
                 # 只有行程单没有发票
                 for t in trips:
-                    all_records.append({'inv_no': '待匹配', 'amount': 0, 'type': '行程单', 'from': t['from'], 'to': t['to'], 'trip_count': 1, 'pdf_path': '', 'pdf_paths': []})
+                    all_records.append({'inv_no': '待匹配', 'amount': 0, 'type': '行程单', 'from': t['from'], 'to': t['to'], 'trip_date': t.get('date', ''), 'trip_count': 1, 'pdf_path': '', 'pdf_paths': []})
     
     mail.logout()
     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -368,7 +514,7 @@ def build_excel(all_records):
         c.font, c.fill, c.alignment, c.border = hfont, hf, ctr, thin
     
     row = 3
-    type_order = ['滴滴', '阳光出行', '通行费', '行程单']
+    type_order = ['滴滴', '阳光出行', '通行费', '携程机票', '12306 火车票', '行程单']
     type_counters = {t: 0 for t in type_order}
     for inv_type in type_order:
         recs = [r for r in all_records if r.get('type') == inv_type]
@@ -376,12 +522,13 @@ def build_excel(all_records):
         for r in recs:
             type_counters[inv_type] += 1
             trip_count = r.get('trip_count', 0)
+            trip_date = r.get('trip_date', '')
             from_loc = r.get('from', '详见发票')
             to_loc = r.get('to', '详见发票')
             if trip_count > 1:
                 from_loc = f"对应{trip_count}个行程"
                 to_loc = ""
-            for col, v in enumerate([str(type_counters[inv_type]), r.get('type',''), r.get('inv_no',''), '', from_loc, to_loc, r.get('amount',0), r.get('word_page','')], 1):
+            for col, v in enumerate([str(type_counters[inv_type]), r.get('type',''), r.get('inv_no',''), trip_date, from_loc, to_loc, r.get('amount',0), r.get('word_page','')], 1):
                 c = ws.cell(row=row, column=col, value=v)
                 c.font, c.border, c.alignment = dfont, thin, ctr if col in (1,2,3,4,7,8) else lft
                 if col == 7: c.number_format = '#,##0.00'
