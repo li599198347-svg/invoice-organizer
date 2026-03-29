@@ -220,8 +220,8 @@ def process_pdf(tmp_path, pdf_dir, all_records, inv_type, em, filename):
     trip_date = date_m.group(1) if date_m else em.get('date','')
 
     # Extract from/to
-    from_m = re.search(r'出发地 [：:]*\s*([\u4e00-\u9fffA-Za-z0-9\(\)\-]{0,40}?)', text)
-    to_m = re.search(r'到达地 [：:]*\s*([\u4e00-\u9fffA-Za-z0-9\(\)\-]{0,40}?)', text)
+    from_m = re.search(r'出\s*发\s*地 [：:]*\s*([\u4e00-\u9fffA-Za-z0-9\(\)\-]{0,50}?)', text)
+    to_m = re.search(r'到\s*达\s*地 [：:]*\s*([\u4e00-\u9fffA-Za-z0-9\(\)\-]{0,50}?)', text)
     route_from = from_m.group(1).strip() if from_m else ''
     route_to = to_m.group(1).strip() if to_m else ''
 
